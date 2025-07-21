@@ -17,27 +17,67 @@ class Program
 
         string icsUrl = configuration["Outlook_ICS_URL"];
         string googleCalendarId = configuration["GoogleCalendarID"];
-
         CalendarService googleService = GetGoogleCalendarService(configuration["GoogleOAuth2ClientSecret"]);
 
         List<CalendarEvent> icalEvents = await LoadIcsEvents(icsUrl);
-
+        List<Event> gCalEvents = await GetExistingGCalEvents(googleService, googleCalendarId);
         string gCalTimeZone = (await googleService.Calendars.Get(googleCalendarId).ExecuteAsync()).TimeZone;
 
-        //TODO: remove this
-        await ClearGoogleCalendar(googleService, googleCalendarId);
+        // Build lookup dictionaries by synthetic key
+        Dictionary<string, CalendarEvent> icalLookup = icalEvents.GroupBy(e => GenerateMatchKey(e)).ToDictionary(g => g.Key, g => g.First());
+        Dictionary<string, Event> gCalLookup = gCalEvents.GroupBy(e => GenerateMatchKey(e)).ToDictionary(g => g.Key, g => g.First());
 
-        BatchRequest batchRequest = new BatchRequest(googleService);
-        foreach (CalendarEvent ev in icalEvents)
+        BatchRequest batch = new(googleService);
+
+        // INSERT missing events
+        foreach (KeyValuePair<string, CalendarEvent> kvp in icalLookup)
         {
-            Console.WriteLine($"{icalEvents.IndexOf(ev) + 1} / {icalEvents.Count}");
-            await SyncEventToGoogle(ev, googleService, googleCalendarId, gCalTimeZone, batchRequest);
+            if (gCalLookup.ContainsKey(kvp.Key))
+                continue;
+
+            SyncEventToGoogle(kvp.Value, googleService, googleCalendarId, gCalTimeZone, batch);
         }
 
-        await batchRequest.ExecuteAsync();
+        // DELETE orphaned events
+        foreach (KeyValuePair<string, Event> kvp in gCalLookup)
+        {
+            if (icalLookup.ContainsKey(kvp.Key))
+                continue;
 
+            batch.Queue<Event>(
+                googleService.Events.Delete(googleCalendarId, kvp.Value.Id),
+                (content, error, i, message) => { /* no-op */ });
+        }
+
+        await batch.ExecuteAsync();
         Console.WriteLine("Sync complete.");
     }
+
+    static string GenerateMatchKey(CalendarEvent e)
+    {
+        string start;
+        string end;
+        if (e.IsAllDay)
+        {
+            start = e.Start.ToString("yyyy-MM-dd");
+            end = e.End.ToString("yyyy-MM-dd");
+        }
+        else
+        {
+            start = $"{e.Start.AsUtc:u}";start = $"{e.Start.AsUtc:u}";
+            end = $"{e.End.AsUtc:u}"; end = $"{e.End.AsUtc:u}";
+        }
+
+        return $"{e.Summary}|{start}|{end}";
+    }
+
+    static string GenerateMatchKey(Event e)
+    {
+        string start = e.Start?.DateTimeDateTimeOffset?.ToUniversalTime().ToString("u") ?? e.Start?.Date;
+        string end = e.End?.DateTimeDateTimeOffset?.ToUniversalTime().ToString("u") ?? e.End?.Date;
+        return $"{e.Summary}|{start}|{end}";
+    }
+
 
     static async Task<string> DownloadWithRedirect(string url)
     {
@@ -80,7 +120,7 @@ class Program
         });
     }
 
-    static async Task SyncEventToGoogle(CalendarEvent icsEvent, CalendarService googleService, string calendarId, string strCalTimezone, BatchRequest batchRequest)
+    static void SyncEventToGoogle(CalendarEvent icsEvent, CalendarService googleService, string calendarId, string strCalTimezone, BatchRequest batchRequest)
     {
         DateTimeOffset start = icsEvent.Start.AsUtc.ToUniversalTime();
         DateTimeOffset end = icsEvent.End.AsUtc.ToUniversalTime();
@@ -121,8 +161,7 @@ class Program
             };
         }
 
-
-        Event gEvent = new Google.Apis.Calendar.v3.Data.Event
+        Event gEvent = new()
         {
             Summary = icsEvent.Summary,
             Description = icsEvent.Description,
@@ -133,25 +172,43 @@ class Program
             Recurrence = icsEvent.RecurrenceRules.Select(r => $"RRULE:{r}").ToList()
         };
 
-
-        //// Optional: Try to find existing event by UID or summary+time
-        //Event? existing = await FindExistingEvent(icsEvent, googleService, calendarId, start, end);
-
-        //if (existing != null)
-        //{
-        //    gEvent.Id = existing.Id;
-        //    batchRequest.Queue<Event>(googleService.Events.Update(gEvent, calendarId, gEvent.Id), (content, error, i, message) =>
-        //    {
-        //        //don't care
-        //    });
-        //}
-        //else
-        //{
         batchRequest.Queue<Event>(googleService.Events.Insert(gEvent, calendarId), (content, error, i, message) =>
         {
             //don't care
         });
-        //}
+    }
+
+    static async Task<List<Event>> GetExistingGCalEvents(
+        CalendarService googleService,
+        string calendarId)
+    {
+        HashSet<string> seenIDs = [];
+        List<Event> theReturn = [];
+
+        string? strPageToken = null;
+
+        do
+        {
+            EventsResource.ListRequest request = googleService.Events.List(calendarId);
+            request.SingleEvents = true;
+            request.ShowDeleted = false;
+            request.TimeMinDateTimeOffset = DateTimeOffset.MinValue;
+            request.TimeMaxDateTimeOffset = DateTimeOffset.MaxValue;
+            request.PageToken = strPageToken;
+
+            Events results = await request.ExecuteAsync();
+            foreach (var e in results.Items)
+            {
+                var useThisID = e.RecurringEventId ?? e.Id;
+                if (!seenIDs.Add(useThisID)) continue;
+                theReturn.Add(e);
+            }
+
+            strPageToken = results.NextPageToken;
+        }
+        while (strPageToken != null);
+
+        return theReturn;
     }
 
     static async Task ClearGoogleCalendar(
@@ -169,7 +226,7 @@ class Program
         Events results = await request.ExecuteAsync();
         while (results.Items.Count > 0)
         {
-            BatchRequest batchRequest = new BatchRequest(googleService);
+            BatchRequest batchRequest = new(googleService);
             foreach (var e in results.Items)
             {
                 var useThisID = e.RecurringEventId ?? e.Id;
@@ -198,28 +255,4 @@ class Program
             results = await request.ExecuteAsync();
         }
     }
-
-    static async Task<Google.Apis.Calendar.v3.Data.Event?> FindExistingEvent(
-        CalendarEvent icsEvent,
-        CalendarService googleService,
-        string calendarId,
-        DateTimeOffset start,
-        DateTimeOffset end)
-    {
-        EventsResource.ListRequest request = googleService.Events.List(calendarId);
-        request.TimeMinDateTimeOffset = start.AddMinutes(-1);
-        request.TimeMaxDateTimeOffset = end.AddMinutes(1);
-        request.Q = icsEvent.Summary;
-        request.SingleEvents = true;
-
-        Events results = await request.ExecuteAsync();
-
-        return results.Items.FirstOrDefault(e =>
-            e.Summary == icsEvent.Summary &&
-            e.Start?.DateTimeDateTimeOffset == start &&
-            e.End?.DateTimeDateTimeOffset == end
-        );
-    }
-
-
 }
