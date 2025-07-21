@@ -12,7 +12,9 @@ class Program
     static async Task Main()
     {
         IConfigurationRoot configuration = new ConfigurationBuilder()
+            .SetBasePath(Directory.GetCurrentDirectory())
             .AddUserSecrets<Program>()
+            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
             .Build();
 
         string icsUrl = configuration["Outlook_ICS_URL"];
