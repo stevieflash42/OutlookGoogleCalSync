@@ -155,13 +155,7 @@ class Program
         EventDateTime startEventDateTime = GetEventDateTimeFromCalDateTime(icsEvent.Start, icsEvent.IsAllDay);
         EventDateTime endEventDateTime = GetEventDateTimeFromCalDateTime(icsEvent.End, icsEvent.IsAllDay);
 
-        List<string> recurrence = icsEvent.RecurrenceRules.Select(r => $"RRULE:{r}").ToList();
-        string exceptionDates = string.Join(",", icsEvent.ExceptionDates.GetAllDates().Select(exd => $"{exd.AsUtc.ToUniversalTime():yyyyMMdd}"));
-
-        if(!string.IsNullOrWhiteSpace(exceptionDates))
-        {
-            recurrence.Add($"EXDATE:{exceptionDates}");
-        }
+        List<string> recurrence = BuildRecurrenceList(icsEvent);
 
         bool bUpdated = false;
 
@@ -206,14 +200,14 @@ class Program
             gEvent.Recurrence = recurrence;
             bUpdated = true;
 
-            //https://www.nylas.com/blog/calendar-events-rrules/
-            batchRequest.Queue<Event>(
-                googleService.Events.Delete(calendarId, gEvent.Id),
-                (content, error, i, message) => { /* no-op */ });
+            ////https://www.nylas.com/blog/calendar-events-rrules/
+            //batchRequest.Queue<Event>(
+            //    googleService.Events.Delete(calendarId, gEvent.Id),
+            //    (content, error, i, message) => { /* no-op */ });
 
-            CreateGoogleEvent(icsEvent, googleService, calendarId, strCalTimezone, batchRequest);
+            //CreateGoogleEvent(icsEvent, googleService, calendarId, strCalTimezone, batchRequest);
 
-            return;
+            //return;
         }
 
         if (bUpdated)
@@ -230,6 +224,23 @@ class Program
 
     private static string GetOrderedRecurrenceString(string strRecurr) => string.Join(";", strRecurr.Split(";").OrderBy(str => str));
 
+    private static List<string> BuildRecurrenceList(CalendarEvent icsEvent)
+    {
+        string strDateFormat = icsEvent.IsAllDay ? "yyyyMMdd" : "yyyyMMddTHHmmss";
+        string strZFormatVal = icsEvent.IsAllDay ? "" : "Z";
+
+        List<string> recurrence = icsEvent.RecurrenceRules.Select(r => $"RRULE:{r}").ToList();
+        string exceptionDates = string.Join(",", icsEvent.ExceptionDates.GetAllDates().Select(exd => exd.AsUtc.ToUniversalTime().ToString(strDateFormat) + strZFormatVal));
+
+        if (!string.IsNullOrWhiteSpace(exceptionDates))
+        {
+            //https://www.rfc-editor.org/rfc/rfc5545
+            recurrence.Add($"EXDATE;VALUE=DATE:{exceptionDates}");
+        }
+
+        return recurrence;
+    }
+
     static void CreateGoogleEvent(CalendarEvent icsEvent, CalendarService googleService, string calendarId, string strCalTimezone, BatchRequest batchRequest)
     {
         DateTimeOffset start = icsEvent.Start.AsUtc.ToUniversalTime();
@@ -238,8 +249,7 @@ class Program
         EventDateTime startEventDateTime = GetEventDateTimeFromCalDateTime(icsEvent.Start, icsEvent.IsAllDay);
         EventDateTime endEventDateTime = GetEventDateTimeFromCalDateTime(icsEvent.End, icsEvent.IsAllDay);
 
-        IEnumerable<string> recurrenceRules = icsEvent.RecurrenceRules.Select(r => $"RRULE:{r}");
-        IEnumerable<string> exceptionDates = icsEvent.ExceptionDates.GetAllDates().Select(exd => $"EXDATE:{exd.AsUtc.ToUniversalTime():yyyyMMdd}");
+        List<string> recurrence = BuildRecurrenceList(icsEvent);
 
         Event gEvent = new()
         {
@@ -250,7 +260,7 @@ class Program
             End = endEventDateTime,
             //{FREQ=WEEKLY;UNTIL=20251128T150000Z;WKST=SU;BYDAY=FR}
             //https://developers.google.com/workspace/calendar/api/concepts/events-calendars#recurring_events
-            Recurrence = recurrenceRules.Union(exceptionDates).ToList()
+            Recurrence = recurrence
         };
 
         batchRequest.Queue<Event>(googleService.Events.Insert(gEvent, calendarId), (content, error, i, message) =>
