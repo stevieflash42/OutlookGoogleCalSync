@@ -4,8 +4,10 @@ using Google.Apis.Calendar.v3.Data;
 using Google.Apis.Requests;
 using Google.Apis.Services;
 using Ical.Net.CalendarComponents;
+using Ical.Net.DataTypes;
 using Microsoft.Extensions.Configuration;
 using Newtonsoft.Json;
+using System.Linq;
 
 class Program
 {
@@ -34,10 +36,13 @@ class Program
         // INSERT missing events
         foreach (KeyValuePair<string, CalendarEvent> kvp in icalLookup)
         {
-            if (gCalLookup.ContainsKey(kvp.Key))
+            if (gCalLookup.TryGetValue(kvp.Key, out Event? gEvent))
+            {
+                UpdateGoogleEvent(gEvent, kvp.Value, googleService, googleCalendarId, gCalTimeZone, batch);
                 continue;
+            }
 
-            SyncEventToGoogle(kvp.Value, googleService, googleCalendarId, gCalTimeZone, batch);
+            CreateGoogleEvent(kvp.Value, googleService, googleCalendarId, gCalTimeZone, batch);
         }
 
         // DELETE orphaned events
@@ -66,7 +71,7 @@ class Program
         }
         else
         {
-            start = $"{e.Start.AsUtc:u}";start = $"{e.Start.AsUtc:u}";
+            start = $"{e.Start.AsUtc:u}"; start = $"{e.Start.AsUtc:u}";
             end = $"{e.End.AsUtc:u}"; end = $"{e.End.AsUtc:u}";
         }
 
@@ -122,46 +127,119 @@ class Program
         });
     }
 
-    static void SyncEventToGoogle(CalendarEvent icsEvent, CalendarService googleService, string calendarId, string strCalTimezone, BatchRequest batchRequest)
+    private static EventDateTime GetEventDateTimeFromCalDateTime(CalDateTime calDateTime, bool isAllDay)
+    {
+        DateTimeOffset dtOff = calDateTime.AsUtc.ToUniversalTime();
+        if (isAllDay)
+        {
+            return new EventDateTime
+            {
+                Date = dtOff.ToString("yyyy-MM-dd")
+            };
+        }
+        else
+        {
+            return new EventDateTime
+            {
+                DateTimeDateTimeOffset = dtOff,
+                TimeZone = "UTC"
+            };
+        }
+    }
+
+    static void UpdateGoogleEvent(Event gEvent, CalendarEvent icsEvent, CalendarService googleService, string calendarId, string strCalTimezone, BatchRequest batchRequest)
     {
         DateTimeOffset start = icsEvent.Start.AsUtc.ToUniversalTime();
         DateTimeOffset end = icsEvent.End.AsUtc.ToUniversalTime();
 
-        EventDateTime startEventDateTime;
-        if (icsEvent.IsAllDay)
+        EventDateTime startEventDateTime = GetEventDateTimeFromCalDateTime(icsEvent.Start, icsEvent.IsAllDay);
+        EventDateTime endEventDateTime = GetEventDateTimeFromCalDateTime(icsEvent.End, icsEvent.IsAllDay);
+
+        List<string> recurrence = icsEvent.RecurrenceRules.Select(r => $"RRULE:{r}").ToList();
+        string exceptionDates = string.Join(",", icsEvent.ExceptionDates.GetAllDates().Select(exd => $"{exd.AsUtc.ToUniversalTime():yyyyMMdd}"));
+
+        if(!string.IsNullOrWhiteSpace(exceptionDates))
         {
-            startEventDateTime = new EventDateTime
-            {
-                Date = start.ToString("yyyy-MM-dd"),
-                //TimeZone = strCalTimezone
-            };
-        }
-        else
-        {
-            startEventDateTime = new EventDateTime
-            {
-                DateTimeDateTimeOffset = start,
-                TimeZone = "UTC"
-            };
+            recurrence.Add($"EXDATE:{exceptionDates}");
         }
 
-        EventDateTime endEventDateTime;
-        if (icsEvent.IsAllDay)
+        bool bUpdated = false;
+
+        //shouldn't happen??
+        if (gEvent.Summary != icsEvent.Summary)
         {
-            endEventDateTime = new EventDateTime
-            {
-                Date = end.ToString("yyyy-MM-dd"),
-                //TimeZone = strCalTimezone
-            };
+            gEvent.Summary = icsEvent.Summary;
+            bUpdated = true;
         }
-        else
+
+        if (gEvent.Description != icsEvent.Description)
         {
-            endEventDateTime = new EventDateTime
-            {
-                DateTimeDateTimeOffset = end,
-                TimeZone = "UTC"
-            };
+            gEvent.Description = icsEvent.Description;
+            bUpdated = true;
         }
+
+        if (gEvent.Location != icsEvent.Location &&
+            string.IsNullOrWhiteSpace(gEvent.Location) !=
+            string.IsNullOrWhiteSpace(icsEvent.Location))
+        {
+            gEvent.Location = icsEvent.Location;
+            bUpdated = true;
+        }
+
+        if (gEvent.Start.DateTimeDateTimeOffset != startEventDateTime.DateTimeDateTimeOffset)
+        {
+            gEvent.Start = startEventDateTime;
+            bUpdated = true;
+        }
+
+        if (gEvent.End.DateTimeDateTimeOffset != endEventDateTime.DateTimeDateTimeOffset)
+        {
+            gEvent.End = endEventDateTime;
+            bUpdated = true;
+        }
+
+        bool gEventHasRecurrence = gEvent.Recurrence != null && gEvent.Recurrence.Count != 0;
+        bool iCalEventHasRecurrence = recurrence.Count != 0;
+        if (gEventHasRecurrence != iCalEventHasRecurrence ||
+            (gEventHasRecurrence && gEvent.Recurrence.Count != recurrence.Select(GetOrderedRecurrenceString).Union(gEvent.Recurrence.Select(GetOrderedRecurrenceString)).Count()))
+        {
+            gEvent.Recurrence = recurrence;
+            bUpdated = true;
+
+            //https://www.nylas.com/blog/calendar-events-rrules/
+            batchRequest.Queue<Event>(
+                googleService.Events.Delete(calendarId, gEvent.Id),
+                (content, error, i, message) => { /* no-op */ });
+
+            CreateGoogleEvent(icsEvent, googleService, calendarId, strCalTimezone, batchRequest);
+
+            return;
+        }
+
+        if (bUpdated)
+        {
+            batchRequest.Queue<Event>(googleService.Events.Update(gEvent, calendarId, gEvent.Id), (content, error, i, message) =>
+            {
+                if(error!=null)
+                {
+                }
+                //don't care
+            });
+        }
+    }
+
+    private static string GetOrderedRecurrenceString(string strRecurr) => string.Join(";", strRecurr.Split(";").OrderBy(str => str));
+
+    static void CreateGoogleEvent(CalendarEvent icsEvent, CalendarService googleService, string calendarId, string strCalTimezone, BatchRequest batchRequest)
+    {
+        DateTimeOffset start = icsEvent.Start.AsUtc.ToUniversalTime();
+        DateTimeOffset end = icsEvent.End.AsUtc.ToUniversalTime();
+
+        EventDateTime startEventDateTime = GetEventDateTimeFromCalDateTime(icsEvent.Start, icsEvent.IsAllDay);
+        EventDateTime endEventDateTime = GetEventDateTimeFromCalDateTime(icsEvent.End, icsEvent.IsAllDay);
+
+        IEnumerable<string> recurrenceRules = icsEvent.RecurrenceRules.Select(r => $"RRULE:{r}");
+        IEnumerable<string> exceptionDates = icsEvent.ExceptionDates.GetAllDates().Select(exd => $"EXDATE:{exd.AsUtc.ToUniversalTime():yyyyMMdd}");
 
         Event gEvent = new()
         {
@@ -171,7 +249,8 @@ class Program
             Start = startEventDateTime,
             End = endEventDateTime,
             //{FREQ=WEEKLY;UNTIL=20251128T150000Z;WKST=SU;BYDAY=FR}
-            Recurrence = icsEvent.RecurrenceRules.Select(r => $"RRULE:{r}").ToList()
+            //https://developers.google.com/workspace/calendar/api/concepts/events-calendars#recurring_events
+            Recurrence = recurrenceRules.Union(exceptionDates).ToList()
         };
 
         batchRequest.Queue<Event>(googleService.Events.Insert(gEvent, calendarId), (content, error, i, message) =>
@@ -192,7 +271,7 @@ class Program
         do
         {
             EventsResource.ListRequest request = googleService.Events.List(calendarId);
-            request.SingleEvents = true;
+            request.SingleEvents = false;
             request.ShowDeleted = false;
             request.TimeMinDateTimeOffset = DateTimeOffset.MinValue;
             request.TimeMaxDateTimeOffset = DateTimeOffset.MaxValue;
