@@ -7,7 +7,9 @@ using Ical.Net.CalendarComponents;
 using Ical.Net.DataTypes;
 using Microsoft.Extensions.Configuration;
 using Newtonsoft.Json;
+using System;
 using System.Linq;
+using System.Text.RegularExpressions;
 
 class Program
 {
@@ -22,6 +24,8 @@ class Program
         string icsUrl = configuration["Outlook_ICS_URL"];
         string googleCalendarId = configuration["GoogleCalendarID"];
         CalendarService googleService = GetGoogleCalendarService(configuration["GoogleOAuth2ClientSecret"]);
+
+        //await ClearGoogleCalendar(googleService, googleCalendarId);
 
         List<CalendarEvent> icalEvents = await LoadIcsEvents(icsUrl);
         List<Event> gCalEvents = await GetExistingGCalEvents(googleService, googleCalendarId);
@@ -104,6 +108,7 @@ class Program
         string icsContent = await DownloadWithRedirect(url);
 
         Ical.Net.Calendar? calendar = Ical.Net.Calendar.Load(icsContent);
+
         return calendar.Events
             .Where(e => !e.Summary.StartsWith("Declined:") && e.Summary != "Reminder to prep for: Platform-wide Weekly Sync")
             .ToList();
@@ -129,29 +134,46 @@ class Program
 
     private static EventDateTime GetEventDateTimeFromCalDateTime(CalDateTime calDateTime, bool isAllDay)
     {
-        DateTimeOffset dtOff = calDateTime.AsUtc.ToUniversalTime();
         if (isAllDay)
         {
             return new EventDateTime
             {
-                Date = dtOff.ToString("yyyy-MM-dd")
+                Date = calDateTime.AsUtc.ToUniversalTime().ToString("yyyy-MM-dd")
             };
         }
         else
         {
+            // Use the local datetime value from the iCal event
+            DateTime dt = calDateTime.Value;
+            string windowsTimeZoneId = calDateTime.TzId ?? "UTC";
+            string ianaTimeZoneId = windowsTimeZoneId;
+
+            // Try to convert Windows timezone ID to IANA format for Google Calendar
+            if (!string.IsNullOrEmpty(calDateTime.TzId) &&
+                TimeZoneInfo.TryConvertWindowsIdToIanaId(calDateTime.TzId, out string? ianaId))
+            {
+                ianaTimeZoneId = ianaId;
+            }
+
+            // Get the TimeZoneInfo to calculate the correct offset for this specific datetime
+            TimeZoneInfo timeZone = TimeZoneInfo.FindSystemTimeZoneById(windowsTimeZoneId);
+
+            // Get the UTC offset for this specific datetime (accounts for DST)
+            TimeSpan offset = timeZone.GetUtcOffset(dt);
+
+            // Create DateTimeOffset with the local time and correct offset
+            DateTimeOffset dateTimeOffset = new DateTimeOffset(dt, offset);
+
             return new EventDateTime
             {
-                DateTimeDateTimeOffset = dtOff,
-                TimeZone = "UTC"
+                DateTimeDateTimeOffset = dateTimeOffset,
+                TimeZone = ianaTimeZoneId
             };
         }
     }
 
     static void UpdateGoogleEvent(Event gEvent, CalendarEvent icsEvent, CalendarService googleService, string calendarId, string strCalTimezone, BatchRequest batchRequest)
     {
-        DateTimeOffset start = icsEvent.Start.AsUtc.ToUniversalTime();
-        DateTimeOffset end = icsEvent.End.AsUtc.ToUniversalTime();
-
         EventDateTime startEventDateTime = GetEventDateTimeFromCalDateTime(icsEvent.Start, icsEvent.IsAllDay);
         EventDateTime endEventDateTime = GetEventDateTimeFromCalDateTime(icsEvent.End, icsEvent.IsAllDay);
 
@@ -168,8 +190,26 @@ class Program
 
         if (gEvent.Description != icsEvent.Description)
         {
-            gEvent.Description = icsEvent.Description;
-            bUpdated = true;
+            // Google Calendar may truncate descriptions, so check if this is a real change
+            bool isRealChange = true;
+
+            // If both are non-null, check if Google's version is a truncated version of the iCal description
+            if (gEvent.Description != null && icsEvent.Description != null)
+            {
+                // Google Calendar truncates descriptions at around 8192 characters
+                // If the Google description matches the start of the iCal description, it's likely truncated
+                if (icsEvent.Description.StartsWith(gEvent.Description) &&
+                    gEvent.Description.Length >= 8000) // Close to the limit
+                {
+                    isRealChange = false;
+                }
+            }
+
+            if (isRealChange)
+            {
+                gEvent.Description = icsEvent.Description;
+                bUpdated = true;
+            }
         }
 
         if (gEvent.Location != icsEvent.Location &&
@@ -180,13 +220,16 @@ class Program
             bUpdated = true;
         }
 
-        if (gEvent.Start.DateTimeDateTimeOffset != startEventDateTime.DateTimeDateTimeOffset)
+        // Compare DateTimeDateTimeOffset values and TimeZone
+        if (gEvent.Start.DateTimeDateTimeOffset != startEventDateTime.DateTimeDateTimeOffset ||
+            gEvent.Start.TimeZone != startEventDateTime.TimeZone)
         {
             gEvent.Start = startEventDateTime;
             bUpdated = true;
         }
 
-        if (gEvent.End.DateTimeDateTimeOffset != endEventDateTime.DateTimeDateTimeOffset)
+        if (gEvent.End.DateTimeDateTimeOffset != endEventDateTime.DateTimeDateTimeOffset ||
+            gEvent.End.TimeZone != endEventDateTime.TimeZone)
         {
             gEvent.End = endEventDateTime;
             bUpdated = true;
@@ -214,7 +257,7 @@ class Program
         {
             batchRequest.Queue<Event>(googleService.Events.Update(gEvent, calendarId, gEvent.Id), (content, error, i, message) =>
             {
-                if(error!=null)
+                if (error != null)
                 {
                 }
                 //don't care
@@ -222,7 +265,68 @@ class Program
         }
     }
 
-    private static string GetOrderedRecurrenceString(string strRecurr) => string.Join(";", strRecurr.Split(";").OrderBy(str => str));
+    private static string GetOrderedRecurrenceString(string strRecurr)
+    {
+       return string.Join(";", ConvertExDateToUtc(strRecurr).Split(";").OrderBy(str => str));
+    }
+
+    /// <summary>
+    /// VIBED
+    /// </summary>
+    /// <param name="possibleExDateLine"></param>
+    /// <returns></returns>
+    public static string ConvertExDateToUtc(string possibleExDateLine)
+    {
+        if(!possibleExDateLine.Contains("EXDATE")) return possibleExDateLine;
+
+        // Parse the timezone from TZID parameter
+        var tzidMatch = Regex.Match(possibleExDateLine, @"TZID=([^:;]+)");
+        if (!tzidMatch.Success)
+        {
+            return possibleExDateLine;
+        }
+
+        string tzid = tzidMatch.Groups[1].Value;
+        TimeZoneInfo timeZone = TimeZoneInfo.FindSystemTimeZoneById(tzid);
+
+        // Extract the dates portion after the colon
+        var datesMatch = Regex.Match(possibleExDateLine, @":(.+)$");
+        if (!datesMatch.Success)
+        {
+            return possibleExDateLine;
+        }
+
+        string datesStr = datesMatch.Groups[1].Value;
+        string[] dates = datesStr.Split(',');
+
+        // Convert each date to UTC
+        var utcDates = dates.Select(dateStr =>
+        {
+            // Parse the local datetime (format: yyyyMMddTHHmmss)
+            int year = int.Parse(dateStr.Substring(0, 4));
+            int month = int.Parse(dateStr.Substring(4, 2));
+            int day = int.Parse(dateStr.Substring(6, 2));
+            int hour = int.Parse(dateStr.Substring(9, 2));
+            int minute = int.Parse(dateStr.Substring(11, 2));
+            int second = int.Parse(dateStr.Substring(13, 2));
+
+            // Create DateTime in the specified timezone
+            DateTime localTime = new DateTime(year, month, day, hour, minute, second, DateTimeKind.Unspecified);
+
+            // Get the UTC offset for this specific datetime (accounts for DST)
+            TimeSpan offset = timeZone.GetUtcOffset(localTime);
+
+            // Convert to UTC
+            DateTimeOffset localDto = new DateTimeOffset(localTime, offset);
+            DateTime utcTime = localDto.UtcDateTime;
+
+            // Format as yyyyMMddTHHmmssZ
+            return utcTime.ToString("yyyyMMdd'T'HHmmss'Z'");
+        });
+
+        // Build the result
+        return $"EXDATE;VALUE=DATE:{string.Join(",", utcDates)}";
+    }
 
     private static List<string> BuildRecurrenceList(CalendarEvent icsEvent)
     {
@@ -265,6 +369,9 @@ class Program
 
         batchRequest.Queue<Event>(googleService.Events.Insert(gEvent, calendarId), (content, error, i, message) =>
         {
+            if (error != null)
+            {
+            }
             //don't care
         });
     }
