@@ -28,16 +28,56 @@ class Program
         //await ClearGoogleCalendar(googleService, googleCalendarId);
 
         List<CalendarEvent> icalEvents = await LoadIcsEvents(icsUrl);
-        List<Event> gCalEvents = await GetExistingGCalEvents(googleService, googleCalendarId);
+        List<Event> gCalMasterEvents = await GetExistingGCalEvents(googleService, googleCalendarId);
+        List<Event> gCalModifiedInstances = await GetModifiedRecurringInstances(googleService, googleCalendarId);
         string gCalTimeZone = (await googleService.Calendars.Get(googleCalendarId).ExecuteAsync()).TimeZone;
 
         // Build lookup dictionaries by synthetic key
         Dictionary<string, CalendarEvent> icalLookup = icalEvents.GroupBy(e => GenerateMatchKey(e)).ToDictionary(g => g.Key, g => g.First());
-        Dictionary<string, Event> gCalLookup = gCalEvents.GroupBy(e => GenerateMatchKey(e)).ToDictionary(g => g.Key, g => g.First());
+        Dictionary<string, Event> gCalLookup = gCalMasterEvents.GroupBy(e => GenerateMatchKey(e)).ToDictionary(g => g.Key, g => g.First());
+
+        // DEBUG: Show what we found
+        Console.WriteLine($"\n=== SYNC SUMMARY ===");
+        Console.WriteLine($"iCal events: {icalEvents.Count}");
+        Console.WriteLine($"Google master events: {gCalMasterEvents.Count}");
+        Console.WriteLine($"Modified instances: {gCalModifiedInstances.Count}");
+
+        // DEBUG: Check for 4DX Platform Stand Up specifically
+        var ical4dx = icalEvents.Where(e => e.Summary?.Contains("4DX Platform Stand Up") == true).ToList();
+        var gcal4dx = gCalMasterEvents.Where(e => e.Summary?.Contains("4DX Platform Stand Up") == true).ToList();
+        Console.WriteLine($"\n4DX Platform Stand Up - iCal: {ical4dx.Count}, Google: {gcal4dx.Count}");
+
+        if (ical4dx.Any())
+        {
+            var first = ical4dx.First();
+            Console.WriteLine($"  iCal Match Key: {GenerateMatchKey(first)}");
+        }
+
+        if (gcal4dx.Any())
+        {
+            var first = gcal4dx.First();
+            Console.WriteLine($"  Google Match Key: {GenerateMatchKey(first)}");
+        }
 
         BatchRequest batch = new(googleService);
 
-        // INSERT missing events
+        // DELETE all modified recurring instances since they don't match the ICS source of truth
+        Console.WriteLine($"Found {gCalModifiedInstances.Count} modified recurring instances to reset...");
+        foreach (Event modifiedInstance in gCalModifiedInstances)
+        {
+            Console.WriteLine($"  Deleting modified instance: {modifiedInstance.Summary} on {modifiedInstance.Start.DateTimeDateTimeOffset}");
+            batch.Queue<Event>(
+                googleService.Events.Delete(googleCalendarId, modifiedInstance.Id),
+                (content, error, i, message) =>
+                {
+                    if (error != null)
+                    {
+                        Console.WriteLine($"!!! ERROR deleting modified instance: {error.Message}");
+                    }
+                });
+        }
+
+        // INSERT or UPDATE events
         foreach (KeyValuePair<string, CalendarEvent> kvp in icalLookup)
         {
             if (gCalLookup.TryGetValue(kvp.Key, out Event? gEvent))
@@ -49,12 +89,13 @@ class Program
             CreateGoogleEvent(kvp.Value, googleService, googleCalendarId, gCalTimeZone, batch);
         }
 
-        // DELETE orphaned events
+        // DELETE orphaned events (events in Google that aren't in ICS)
         foreach (KeyValuePair<string, Event> kvp in gCalLookup)
         {
             if (icalLookup.ContainsKey(kvp.Key))
                 continue;
 
+            Console.WriteLine($"  Deleting orphaned event: {kvp.Value.Summary}");
             batch.Queue<Event>(
                 googleService.Events.Delete(googleCalendarId, kvp.Value.Id),
                 (content, error, i, message) => { /* no-op */ });
@@ -66,6 +107,14 @@ class Program
 
     static string GenerateMatchKey(CalendarEvent e)
     {
+        // For recurring events, match on summary and recurrence pattern, not date
+        if (e.RecurrenceRules != null && e.RecurrenceRules.Count > 0)
+        {
+            string recurrenceKey = string.Join("|", e.RecurrenceRules.OrderBy(r => r.ToString()));
+            return $"{e.Summary}|RECURRING|{recurrenceKey}";
+        }
+
+        // For non-recurring events, match on summary and date/time
         string start;
         string end;
         if (e.IsAllDay)
@@ -75,8 +124,8 @@ class Program
         }
         else
         {
-            start = $"{e.Start.AsUtc:u}"; start = $"{e.Start.AsUtc:u}";
-            end = $"{e.End.AsUtc:u}"; end = $"{e.End.AsUtc:u}";
+            start = $"{e.Start.AsUtc:u}";
+            end = $"{e.End.AsUtc:u}";
         }
 
         return $"{e.Summary}|{start}|{end}";
@@ -84,6 +133,14 @@ class Program
 
     static string GenerateMatchKey(Event e)
     {
+        // For recurring events, match on summary and recurrence pattern, not date
+        if (e.Recurrence != null && e.Recurrence.Count > 0)
+        {
+            string recurrenceKey = string.Join("|", e.Recurrence.OrderBy(r => r));
+            return $"{e.Summary}|RECURRING|{recurrenceKey}";
+        }
+
+        // For non-recurring events, match on summary and date/time
         string start = e.Start?.DateTimeDateTimeOffset?.ToUniversalTime().ToString("u") ?? e.Start?.Date;
         string end = e.End?.DateTimeDateTimeOffset?.ToUniversalTime().ToString("u") ?? e.End?.Date;
         return $"{e.Summary}|{start}|{end}";
@@ -259,8 +316,8 @@ class Program
             {
                 if (error != null)
                 {
+                    Console.WriteLine($"!!! ERROR updating event: {error.Message}");
                 }
-                //don't care
             });
         }
     }
@@ -388,7 +445,7 @@ class Program
         do
         {
             EventsResource.ListRequest request = googleService.Events.List(calendarId);
-            request.SingleEvents = false;
+            request.SingleEvents = false;  // Get master recurring events, not individual instances
             request.ShowDeleted = false;
             request.TimeMinDateTimeOffset = DateTimeOffset.MinValue;
             request.TimeMaxDateTimeOffset = DateTimeOffset.MaxValue;
@@ -397,6 +454,7 @@ class Program
             Events results = await request.ExecuteAsync();
             foreach (var e in results.Items)
             {
+                // Only include unique events (using RecurringEventId for exceptions, Id for others)
                 var useThisID = e.RecurringEventId ?? e.Id;
                 if (!seenIDs.Add(useThisID)) continue;
                 theReturn.Add(e);
@@ -407,6 +465,71 @@ class Program
         while (strPageToken != null);
 
         return theReturn;
+    }
+
+    static async Task<List<Event>> GetModifiedRecurringInstances(
+        CalendarService googleService,
+        string calendarId)
+    {
+        List<Event> modifiedInstances = [];
+
+        // First, get all master recurring events to know their original schedules
+        HashSet<string> masterEventIds = [];
+        string? strPageToken = null;
+
+        do
+        {
+            EventsResource.ListRequest request = googleService.Events.List(calendarId);
+            request.SingleEvents = false;  // Get master events
+            request.ShowDeleted = false;
+            request.TimeMinDateTimeOffset = DateTimeOffset.MinValue;
+            request.TimeMaxDateTimeOffset = DateTimeOffset.MaxValue;
+            request.PageToken = strPageToken;
+
+            Events results = await request.ExecuteAsync();
+            foreach (var e in results.Items)
+            {
+                // Track all master recurring event IDs
+                if (e.Recurrence != null && e.Recurrence.Count > 0)
+                {
+                    masterEventIds.Add(e.Id);
+                }
+            }
+
+            strPageToken = results.NextPageToken;
+        }
+        while (strPageToken != null);
+
+        // Now fetch with SingleEvents=false again to get exceptions
+        // Exceptions are instances that have been modified or deleted
+        strPageToken = null;
+        do
+        {
+            EventsResource.ListRequest request = googleService.Events.List(calendarId);
+            request.SingleEvents = false;  // This will include exceptions as separate events
+            request.ShowDeleted = false;
+            request.TimeMinDateTimeOffset = DateTimeOffset.MinValue;
+            request.TimeMaxDateTimeOffset = DateTimeOffset.MaxValue;
+            request.PageToken = strPageToken;
+
+            Events results = await request.ExecuteAsync();
+            foreach (var e in results.Items)
+            {
+                // If this event has a RecurringEventId and it's NOT in our master list,
+                // then it's a modified exception
+                if (!string.IsNullOrEmpty(e.RecurringEventId) &&
+                    !masterEventIds.Contains(e.Id) &&
+                    e.Status != "cancelled")
+                {
+                    modifiedInstances.Add(e);
+                }
+            }
+
+            strPageToken = results.NextPageToken;
+        }
+        while (strPageToken != null);
+
+        return modifiedInstances;
     }
 
     static async Task ClearGoogleCalendar(
