@@ -35,9 +35,23 @@ class Program
         Dictionary<string, CalendarEvent> icalLookup = icalEvents.GroupBy(e => GenerateMatchKey(e)).ToDictionary(g => g.Key, g => g.First());
         Dictionary<string, Event> gCalLookup = gCalEvents.GroupBy(e => GenerateMatchKey(e)).ToDictionary(g => g.Key, g => g.First());
 
+
+        // DELETE orphaned events
         BatchRequest batch = new(googleService);
+        foreach (KeyValuePair<string, Event> kvp in gCalLookup)
+        {
+            if (icalLookup.ContainsKey(kvp.Key))
+                continue;
+
+            batch.Queue<Event>(
+                googleService.Events.Delete(googleCalendarId, kvp.Value.Id),
+                (content, error, i, message) => { /* no-op */ });
+        }
+        await batch.ExecuteAsync();
+
 
         // INSERT missing events
+        batch = new(googleService);
         foreach (KeyValuePair<string, CalendarEvent> kvp in icalLookup)
         {
             if (gCalLookup.TryGetValue(kvp.Key, out Event? gEvent))
@@ -47,17 +61,6 @@ class Program
             }
 
             CreateGoogleEvent(kvp.Value, googleService, googleCalendarId, gCalTimeZone, batch);
-        }
-
-        // DELETE orphaned events
-        foreach (KeyValuePair<string, Event> kvp in gCalLookup)
-        {
-            if (icalLookup.ContainsKey(kvp.Key))
-                continue;
-
-            batch.Queue<Event>(
-                googleService.Events.Delete(googleCalendarId, kvp.Value.Id),
-                (content, error, i, message) => { /* no-op */ });
         }
 
         await batch.ExecuteAsync();
